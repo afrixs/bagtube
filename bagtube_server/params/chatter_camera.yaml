@@ -1,11 +1,12 @@
 bagtube_server:
   ros__parameters:
+    toggle_input_nodes_running_services: [set_capture]
     pipes: [chatter, image_raw]
     chatter:
-      type: std_msgs/String
+      type: std_msgs/msg/String
       input_topic: /chatter
       output_topic: /chatter_stream
     image_raw:
-      type: sensor_msgs/Image
+      type: sensor_msgs/msg/Image
       input_topic: /image_raw
       output_topic: /image_stream

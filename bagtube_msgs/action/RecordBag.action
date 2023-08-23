@@ -1,0 +1,10 @@
+# request
+string name
+float64 max_duration
+---
+# result
+string bag_path
+float64 duration
+---
+# feedback
+float64 current_duration
