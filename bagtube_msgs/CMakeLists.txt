@@ -17,6 +17,7 @@ set(dependencies
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/RecordBag.action"
+  "action/PlayBag.action"
   DEPENDENCIES ${dependencies}
 )
 

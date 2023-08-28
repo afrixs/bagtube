@@ -2,16 +2,19 @@ import rclpy
 import os
 import datetime
 import threading
-from rclpy.time import Duration
+from rclpy.time import Duration, Time
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from std_srvs.srv import SetBool
-from bagtube_msgs.action import RecordBag
+from bagtube_msgs.action import RecordBag, PlayBag
+import builtin_interfaces
+from rosgraph_msgs.msg import Clock
 
-from rosbag2_py import StorageOptions, RecordOptions, Recorder, Player
+from rosbag2_py import StorageOptions, RecordOptions, Recorder, Player, BagMetadata, Info
+from bagtube_rosbag2_py import Player, PlayOptions
 from rosbag2_py import get_registered_compressors
 from rosbag2_py import get_registered_serializers
 from rosbag2_py import get_registered_writers
@@ -33,7 +36,7 @@ class BagtubeServer(Node):
         self.pipe_publishers = {}
         self.pipe_subscribers = {}
         self.input_nodes_running_services = {}
-        self.topics = []
+        self.topic_remappings = {}
         self.input_nodes_running_services_lock = threading.Lock()
 
         for pipe in pipes:
@@ -41,7 +44,7 @@ class BagtubeServer(Node):
             input_topic = self.declare_parameter(f'{pipe}.input_topic', rclpy.Parameter.Type.STRING).get_parameter_value().string_value
             output_topic = self.declare_parameter(f'{pipe}.output_topic', rclpy.Parameter.Type.STRING).get_parameter_value().string_value
 
-            self.topics.append(input_topic)
+            self.topic_remappings[input_topic] = output_topic
 
             msg_type = self.load_message_type(type_str)
             if msg_type:
@@ -65,13 +68,25 @@ class BagtubeServer(Node):
         for service_name in toggle_input_nodes_services:
             self.toggle_input_nodes_services[service_name] = self.create_client(SetBool, service_name, callback_group=self.sync_service_callback_group)
 
-        self.action_server = ActionServer(
+        self.record_server = ActionServer(
             self,
             RecordBag,
             'record_bag',
             self.record_bag_callback,
-            goal_callback=self.goal_callback,
-            cancel_callback=self.cancel_callback,
+            goal_callback=self.record_goal_callback,
+            cancel_callback=self.record_cancel_callback,
+            callback_group=MutuallyExclusiveCallbackGroup()
+        )
+
+        self.clock_lock = threading.Lock()
+        self.clock_subscriber = self.create_subscription(Clock, 'clock', self.clock_callback, QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+        self.play_server = ActionServer(
+            self,
+            PlayBag,
+            'play_bag',
+            self.play_bag_callback,
+            goal_callback=self.play_goal_callback,
+            cancel_callback=self.play_cancel_callback,
             callback_group=MutuallyExclusiveCallbackGroup()
         )
 
@@ -123,18 +138,18 @@ class BagtubeServer(Node):
         if self.livestream_enabled:
             self.pipe_publishers[pipe].publish(msg)
 
-    def goal_callback(self, goal: RecordBag.Goal):
-        self.get_logger().info(f"Received goal: {goal.name} {goal.max_duration}")
+    def record_goal_callback(self, goal: RecordBag.Goal):
+        self.get_logger().info(f"Received record goal: {goal.name} {goal.max_duration}")
         return GoalResponse.ACCEPT
 
-    def cancel_callback(self, goal_handle):
-        self.get_logger().info(f"Goal {goal_handle.goal_id} canceled")
+    def record_cancel_callback(self, goal_handle):
+        self.get_logger().info(f"Record goal {goal_handle.goal_id} canceled")
         return CancelResponse.ACCEPT
 
     def record_bag_callback(self, goal_handle):
         record_bag_goal = goal_handle.request
 
-        bag_name = record_bag_goal.name + '-' + datetime.datetime.now().strftime('%y_%m_%d-%H_%M_%S')
+        bag_name = record_bag_goal.name + '-' + datetime.datetime.utcnow().strftime('%y_%m_%d-%H_%M_%S.%f')
         bag_path = os.path.join(self.bag_dir_path, bag_name)
 
         self.get_logger().info(f"Recording bag '{bag_path}' for {record_bag_goal.max_duration} seconds")
@@ -146,7 +161,7 @@ class BagtubeServer(Node):
             storage_id=default_writer,
         )
         record_options = RecordOptions()
-        record_options.topics = self.topics
+        record_options.topics = list(self.topic_remappings.keys())
         record_options.is_discovery_disabled = False
         record_options.topic_polling_interval = datetime.timedelta(milliseconds=100)
 
@@ -165,6 +180,9 @@ class BagtubeServer(Node):
         start = self.get_clock().now()
         record_thread.start()
         while rclpy.ok() and not goal_handle.is_cancel_requested and self.get_clock().now() - start < max_duration:
+            feedback = RecordBag.Feedback()
+            feedback.current_duration = (self.get_clock().now() - start).nanoseconds / 1e9
+            goal_handle.publish_feedback(feedback)
             self.get_clock().sleep_for(Duration(seconds=0.1))
         recorder.cancel()
         record_thread.join()
@@ -176,6 +194,77 @@ class BagtubeServer(Node):
 
         result = RecordBag.Result()
         result.bag_path = bag_path
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+        else:
+            goal_handle.succeed()
+        return result
+
+    def play_goal_callback(self, goal: RecordBag.Goal):
+        self.get_logger().info(f"Received play goal: {goal.name} {goal.stamp.sec} {goal.start_offset}")
+        return GoalResponse.ACCEPT
+
+    def play_cancel_callback(self, goal_handle):
+        self.get_logger().info(f"Play goal {goal_handle.goal_id} canceled")
+        return CancelResponse.ACCEPT
+
+    def clock_callback(self, msg):
+        with self.clock_lock:
+            self.play_stamp = Time.from_msg(msg.clock)
+
+    def play_bag_callback(self, goal_handle):
+        play_bag_goal: PlayBag.Goal = goal_handle.request
+
+        sec, nsec = Time.from_msg(play_bag_goal.stamp).seconds_nanoseconds()
+        bag_name = play_bag_goal.name + '-' + datetime.datetime.utcfromtimestamp(sec + nsec/1e9).strftime('%y_%m_%d-%H_%M_%S.%f')
+        bag_path = os.path.join(self.bag_dir_path, bag_name)
+
+        writer_choices = get_registered_writers()
+        default_writer = 'sqlite3' if 'sqlite3' in writer_choices else writer_choices[0]
+        info = Info()
+        metadata = info.read_metadata(bag_path, default_writer)
+        start_time_nsec = int(metadata.starting_time.timestamp()*1e9)
+        start_time = Time(seconds=start_time_nsec // 1e9, nanoseconds=start_time_nsec % 1e9, clock_type=rclpy.clock.ClockType.ROS_TIME)
+        with self.clock_lock:
+            self.play_stamp = start_time + Duration(seconds=play_bag_goal.start_offset)
+
+        self.get_logger().info(f"Playing bag '{bag_path}' with duration {metadata.duration} seconds")
+
+        storage_options = StorageOptions(
+            uri=bag_path,
+            storage_id=default_writer,
+        )
+
+        topic_remapping = ['--ros-args']
+        for key in self.topic_remappings:
+            topic_remapping.append('--remap')
+            topic_remapping.append(f'{key}:={self.topic_remappings[key]}')
+        play_options = PlayOptions()
+        play_options.topic_remapping_options = topic_remapping
+        play_options.topics_to_filter = list(self.topic_remappings.keys())
+        play_options.disable_keyboard_controls = True
+        play_options.clock_publish_frequency = 100
+        play_options.start_offset = play_bag_goal.start_offset
+        player = Player()
+
+        play_thread = threading.Thread(
+            target=player.play,
+            args=(storage_options, play_options),
+            daemon=True)
+
+        play_thread.start()
+        while rclpy.ok() and not goal_handle.is_cancel_requested and not player.has_finished():
+            feedback = PlayBag.Feedback()
+            with self.clock_lock:
+                feedback.current_offset = (self.play_stamp - start_time).nanoseconds / 1e9
+            goal_handle.publish_feedback(feedback)
+            self.get_clock().sleep_for(Duration(seconds=0.1))
+        player.cancel()
+        play_thread.join()
+
+        result = PlayBag.Result()
+        result.stop_offset = (self.play_stamp - start_time).nanoseconds / 1e9  # TODO: subscribe to clock and use that instead
+        self.get_logger().info(f"Playing finished after {result.stop_offset} seconds")
         if goal_handle.is_cancel_requested:
             goal_handle.canceled()
         else:

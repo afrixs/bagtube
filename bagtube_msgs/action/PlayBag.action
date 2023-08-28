@@ -1,0 +1,10 @@
+# request
+string name
+builtin_interfaces/Time stamp
+float64 start_offset
+---
+# result
+float64 stop_offset
+---
+# feedback
+float64 current_offset
