@@ -10,13 +10,11 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from std_srvs.srv import SetBool
 from bagtube_msgs.action import RecordBag, PlayBag
-import builtin_interfaces
+from bagtube_msgs.srv import ControlPlayback
 from rosgraph_msgs.msg import Clock
 
-from rosbag2_py import StorageOptions, RecordOptions, Recorder, Player, BagMetadata, Info
+from rosbag2_py import StorageOptions, RecordOptions, Recorder, Player, Info
 from bagtube_rosbag2_py import Player, PlayOptions
-from rosbag2_py import get_registered_compressors
-from rosbag2_py import get_registered_serializers
 from rosbag2_py import get_registered_writers
 
 
@@ -78,7 +76,7 @@ class BagtubeServer(Node):
             callback_group=MutuallyExclusiveCallbackGroup()
         )
 
-        self.clock_lock = threading.Lock()
+        self.play_control_lock = threading.Lock()
         self.clock_subscriber = self.create_subscription(Clock, 'clock', self.clock_callback, QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.play_server = ActionServer(
             self,
@@ -89,6 +87,7 @@ class BagtubeServer(Node):
             cancel_callback=self.play_cancel_callback,
             callback_group=MutuallyExclusiveCallbackGroup()
         )
+        self.control_playback_service = self.create_service(ControlPlayback, 'control_playback', self.control_playback_callback)
 
         self.init_timer = self.create_timer(0.0, self.init_timer_callback)
 
@@ -209,8 +208,8 @@ class BagtubeServer(Node):
         return CancelResponse.ACCEPT
 
     def clock_callback(self, msg):
-        with self.clock_lock:
-            self.play_stamp = Time.from_msg(msg.clock)
+        with self.play_control_lock:
+            self.playback_stamp = Time.from_msg(msg.clock)
 
     def play_bag_callback(self, goal_handle):
         play_bag_goal: PlayBag.Goal = goal_handle.request
@@ -224,9 +223,6 @@ class BagtubeServer(Node):
         info = Info()
         metadata = info.read_metadata(bag_path, default_writer)
         start_time_nsec = int(metadata.starting_time.timestamp()*1e9)
-        start_time = Time(seconds=start_time_nsec // 1e9, nanoseconds=start_time_nsec % 1e9, clock_type=rclpy.clock.ClockType.ROS_TIME)
-        with self.clock_lock:
-            self.play_stamp = start_time + Duration(seconds=play_bag_goal.start_offset)
 
         self.get_logger().info(f"Playing bag '{bag_path}' with duration {metadata.duration} seconds")
 
@@ -245,25 +241,32 @@ class BagtubeServer(Node):
         play_options.disable_keyboard_controls = True
         play_options.clock_publish_frequency = 100
         play_options.start_offset = play_bag_goal.start_offset
-        player = Player()
+
+        with self.play_control_lock:
+            self.playback_start_time = Time(seconds=start_time_nsec // 1e9, nanoseconds=start_time_nsec % 1e9, clock_type=rclpy.clock.ClockType.ROS_TIME)
+            self.playback_stamp = self.playback_start_time + Duration(seconds=play_bag_goal.start_offset)
+            self.player = Player()
 
         play_thread = threading.Thread(
-            target=player.play,
+            target=self.player.play,
             args=(storage_options, play_options),
             daemon=True)
 
         play_thread.start()
-        while rclpy.ok() and not goal_handle.is_cancel_requested and not player.has_finished():
+        while rclpy.ok() and not goal_handle.is_cancel_requested and not self.player.has_finished():
             feedback = PlayBag.Feedback()
-            with self.clock_lock:
-                feedback.current_offset = (self.play_stamp - start_time).nanoseconds / 1e9
+            with self.play_control_lock:
+                feedback.current_offset = (self.playback_stamp - self.playback_start_time).nanoseconds / 1e9
             goal_handle.publish_feedback(feedback)
             self.get_clock().sleep_for(Duration(seconds=0.1))
-        player.cancel()
+        with self.play_control_lock:
+            self.player.cancel()
         play_thread.join()
 
         result = PlayBag.Result()
-        result.stop_offset = (self.play_stamp - start_time).nanoseconds / 1e9  # TODO: subscribe to clock and use that instead
+        with self.play_control_lock:
+            result.stop_offset = (self.playback_stamp - self.playback_start_time).nanoseconds / 1e9  # TODO: subscribe to clock and use that instead
+            self.player = None
         self.get_logger().info(f"Playing finished after {result.stop_offset} seconds")
         if goal_handle.is_cancel_requested:
             goal_handle.canceled()
@@ -271,10 +274,33 @@ class BagtubeServer(Node):
             goal_handle.succeed()
         return result
 
+    def control_playback_callback(self, request, response):
+        with self.play_control_lock:
+            if not hasattr(self, 'player') or self.player is None:
+                self.get_logger().error(f"Playback control requested but no bag is playing")
+                response.success = False
+                response.message = f"Playback control requested but no bag is playing"
+                return response
+            if request.command == ControlPlayback.Request.PAUSE:
+                self.player.pause()
+                response.current_offset = (self.playback_stamp - self.playback_start_time).nanoseconds / 1e9
+            elif request.command == ControlPlayback.Request.RESUME:
+                self.player.resume()
+            elif request.command == ControlPlayback.Request.SEEK:
+                self.player.seek((self.playback_start_time + rclpy.time.Duration(seconds=request.offset)).nanoseconds)
+            else:
+                self.get_logger().error(f"Invalid playback command: {request.command}")
+                response.success = False
+                response.message = f"Invalid playback command: {request.command}"
+                return response
+        response.success = True
+        response.message = f"Playback command '{request.command}' successful"
+        return response
+
 def main(args=None):
     rclpy.init(args=args)
     node = BagtubeServer()
-    executor = MultiThreadedExecutor(3)
+    executor = MultiThreadedExecutor(4)
     executor.add_node(node)
     try:
         node.get_logger().info('Beginning client, shut down with CTRL-C')

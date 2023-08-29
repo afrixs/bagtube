@@ -1,0 +1,11 @@
+uint32 PAUSE=0
+uint32 RESUME=1
+uint32 SEEK=2
+
+uint32 command
+float64 offset  # for SEEK action
+
+---
+bool success
+string message
+float64 current_offset  # for PAUSE action
