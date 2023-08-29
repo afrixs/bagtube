@@ -10,7 +10,8 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from std_srvs.srv import SetBool
 from bagtube_msgs.action import RecordBag, PlayBag
-from bagtube_msgs.srv import ControlPlayback
+from bagtube_msgs.srv import ControlPlayback, GetBagList
+from bagtube_msgs.msg import BagInfo
 from rosgraph_msgs.msg import Clock
 
 from rosbag2_py import StorageOptions, RecordOptions, Recorder, Player, Info
@@ -19,6 +20,11 @@ from rosbag2_py import get_registered_writers
 
 
 class BagtubeServer(Node):
+    STAMP_FORMAT = '%Y_%m_%d-%H_%M_%S.%f'
+    STAMP_FORMAT_LENGTH = len(datetime.datetime.utcnow().strftime(STAMP_FORMAT))
+    DEFAULT_WRITER = 'sqlite3' if 'sqlite3' in get_registered_writers() else get_registered_writers()[0]
+
+
     def __init__(self):
         super().__init__('bagtube_server')
         pipes = self.declare_parameter('pipes', rclpy.Parameter.Type.STRING_ARRAY).get_parameter_value().string_array_value
@@ -65,6 +71,8 @@ class BagtubeServer(Node):
         self.sync_service_callback_group = MutuallyExclusiveCallbackGroup()
         for service_name in toggle_input_nodes_services:
             self.toggle_input_nodes_services[service_name] = self.create_client(SetBool, service_name, callback_group=self.sync_service_callback_group)
+
+        self.get_bag_list_service = self.create_service(GetBagList, 'get_bag_list', self.get_bag_list_callback)
 
         self.record_server = ActionServer(
             self,
@@ -137,6 +145,38 @@ class BagtubeServer(Node):
         if self.livestream_enabled:
             self.pipe_publishers[pipe].publish(msg)
 
+    def get_bag_list_callback(self, request: GetBagList.Request, response: GetBagList.Response):
+        # return a list of bag directories whose names are in format '{name}-%y_%m_%d-%H_%M_%S.%f'
+        prefix = request.name + '-'
+        required_len = len(prefix) + BagtubeServer.STAMP_FORMAT_LENGTH
+        filter = (lambda dirname: len(dirname) >= required_len and dirname[-BagtubeServer.STAMP_FORMAT_LENGTH - 1] == '-')\
+                    if len(request.name) == 0 else\
+                 (lambda dirname: dirname.startswith(prefix) and len(dirname) == required_len)
+        bag_dirnames = []
+        for dirname in os.listdir(self.bag_dir_path):
+            if os.path.isdir(os.path.join(self.bag_dir_path, dirname)) and filter(dirname):
+                bag_dirnames.append(dirname)
+
+        # extract the timestamp from the directory name
+        for dirname in bag_dirnames:
+            nsec = int(datetime.datetime.strptime(dirname[-BagtubeServer.STAMP_FORMAT_LENGTH:], BagtubeServer.STAMP_FORMAT).timestamp()*1e9)
+            bag = BagInfo()
+            bag.name = dirname[:-BagtubeServer.STAMP_FORMAT_LENGTH - 1]
+            bag.stamp = Time(nanoseconds=nsec).to_msg()
+
+            # get the duration of the bag
+            info = Info()
+            metadata = info.read_metadata(os.path.join(self.bag_dir_path, dirname), BagtubeServer.DEFAULT_WRITER)
+            bag.duration = metadata.duration.total_seconds()
+
+            response.bags.append(bag)
+
+        # sort the bags by timestamp
+        response.bags.sort(key=lambda bag: bag.stamp.sec + bag.stamp.nanosec/1e9)
+        return response
+
+    #############################
+    # Record bag action
     def record_goal_callback(self, goal: RecordBag.Goal):
         self.get_logger().info(f"Received record goal: {goal.name} {goal.max_duration}")
         return GoalResponse.ACCEPT
@@ -148,16 +188,14 @@ class BagtubeServer(Node):
     def record_bag_callback(self, goal_handle):
         record_bag_goal = goal_handle.request
 
-        bag_name = record_bag_goal.name + '-' + datetime.datetime.utcnow().strftime('%y_%m_%d-%H_%M_%S.%f')
+        bag_name = record_bag_goal.name + '-' + datetime.datetime.utcnow().strftime(BagtubeServer.STAMP_FORMAT)
         bag_path = os.path.join(self.bag_dir_path, bag_name)
 
         self.get_logger().info(f"Recording bag '{bag_path}' for {record_bag_goal.max_duration} seconds")
 
-        writer_choices = get_registered_writers()
-        default_writer = 'sqlite3' if 'sqlite3' in writer_choices else writer_choices[0]
         storage_options = StorageOptions(
             uri=bag_path,
-            storage_id=default_writer,
+            storage_id=BagtubeServer.DEFAULT_WRITER,
         )
         record_options = RecordOptions()
         record_options.topics = list(self.topic_remappings.keys())
@@ -199,6 +237,8 @@ class BagtubeServer(Node):
             goal_handle.succeed()
         return result
 
+    #############################
+    # Play bag action
     def play_goal_callback(self, goal: RecordBag.Goal):
         self.get_logger().info(f"Received play goal: {goal.name} {goal.stamp.sec} {goal.start_offset}")
         return GoalResponse.ACCEPT
@@ -218,17 +258,15 @@ class BagtubeServer(Node):
         bag_name = play_bag_goal.name + '-' + datetime.datetime.utcfromtimestamp(sec + nsec/1e9).strftime('%y_%m_%d-%H_%M_%S.%f')
         bag_path = os.path.join(self.bag_dir_path, bag_name)
 
-        writer_choices = get_registered_writers()
-        default_writer = 'sqlite3' if 'sqlite3' in writer_choices else writer_choices[0]
         info = Info()
-        metadata = info.read_metadata(bag_path, default_writer)
+        metadata = info.read_metadata(bag_path, BagtubeServer.DEFAULT_WRITER)
         start_time_nsec = int(metadata.starting_time.timestamp()*1e9)
 
         self.get_logger().info(f"Playing bag '{bag_path}' with duration {metadata.duration} seconds")
 
         storage_options = StorageOptions(
             uri=bag_path,
-            storage_id=default_writer,
+            storage_id=BagtubeServer.DEFAULT_WRITER,
         )
 
         topic_remapping = ['--ros-args']
