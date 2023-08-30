@@ -1,5 +1,6 @@
 bagtube_server:
   ros__parameters:
+    max_total_size_gb: 0.0
     toggle_input_nodes_running_services: [set_capture]
     pipes: [chatter, image_raw]
     chatter:

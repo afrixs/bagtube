@@ -2,6 +2,7 @@ import rclpy
 import os
 import datetime
 import threading
+import shutil
 from rclpy.time import Duration, Time
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
@@ -13,6 +14,7 @@ from bagtube_msgs.action import RecordBag, PlayBag
 from bagtube_msgs.srv import ControlPlayback, GetBagList
 from bagtube_msgs.msg import BagInfo
 from rosgraph_msgs.msg import Clock
+from rcl_interfaces.msg import ParameterDescriptor
 
 from rosbag2_py import StorageOptions, RecordOptions, Recorder, Player, Info
 from bagtube_rosbag2_py import Player, PlayOptions
@@ -30,9 +32,14 @@ class BagtubeServer(Node):
         pipes = self.declare_parameter('pipes', rclpy.Parameter.Type.STRING_ARRAY).get_parameter_value().string_array_value
 
         self.declare_parameter('bag_dir_path', os.path.expanduser('~/.ros/bagtube'))
+        self.declare_parameter('max_total_size_gb', 0.0, ParameterDescriptor(description=
+                                                         'Maximum total size of all bags in GB. 0 for unlimited. If exceeded, oldest bags will be deleted. Note:'
+                                                         ' this is checked after a new bag is recorded, so the actual size may exceed this limit by a small amount.'))
+
         self.bag_dir_path = self.get_parameter('bag_dir_path').get_parameter_value().string_value
         self.bag_dir_path = os.path.abspath(self.bag_dir_path)
         os.makedirs(self.bag_dir_path, exist_ok=True)
+        self.max_total_size_gb = self.get_parameter('max_total_size_gb').get_parameter_value().double_value
 
         self.livestream_enabled = False
         self.recording_bag = False
@@ -216,7 +223,7 @@ class BagtubeServer(Node):
         max_duration = Duration(seconds=record_bag_goal.max_duration)
         start = self.get_clock().now()
         record_thread.start()
-        while rclpy.ok() and not goal_handle.is_cancel_requested and self.get_clock().now() - start < max_duration:
+        while rclpy.ok() and not goal_handle.is_cancel_requested and (max_duration.nanoseconds == 0 or self.get_clock().now() - start < max_duration):
             feedback = RecordBag.Feedback()
             feedback.current_duration = (self.get_clock().now() - start).nanoseconds / 1e9
             goal_handle.publish_feedback(feedback)
@@ -230,12 +237,58 @@ class BagtubeServer(Node):
         self.toggle_input_nodes_running()
 
         result = RecordBag.Result()
-        result.bag_path = bag_path
+
+        gb_to_bytes = 1024 * 1024 * 1024
+        if self.max_total_size_gb > 0.0 and Info().read_metadata(bag_path, BagtubeServer.DEFAULT_WRITER).bag_size > self.max_total_size_gb*gb_to_bytes:
+            self.get_logger().info(f"Recorded bag size exceeds limit of {self.max_total_size_gb} GB, deleting")
+            shutil.rmtree(bag_path)
+        self.limit_total_size()
+
+        if os.path.exists(bag_path):
+            metadata = Info().read_metadata(bag_path, BagtubeServer.DEFAULT_WRITER)
+            if metadata.message_count == 0:
+                shutil.rmtree(bag_path)
+                result.success = False
+                result.message = f"Bag is empty"
+                self.get_logger().info(f"Bag is empty, deleting")
+            else:
+                result.bag.name = record_bag_goal.name
+                nsec = int(datetime.datetime.strptime(bag_name[-BagtubeServer.STAMP_FORMAT_LENGTH:], BagtubeServer.STAMP_FORMAT).timestamp()*1e9)
+                result.bag.stamp = Time(nanoseconds=nsec).to_msg()
+                result.bag.duration = metadata.duration.total_seconds()
+                result.success = True
+        else:
+            result.success = False
+            result.message = f"Bag file does not exist (it was probably deleted due to size limit)"
+            self.get_logger().info(f"Bag file does not exist (it was probably deleted due to size limit)")
+
         if goal_handle.is_cancel_requested:
             goal_handle.canceled()
         else:
             goal_handle.succeed()
         return result
+
+    def limit_total_size(self):
+        # limit the total size of all bags
+        if self.max_total_size_gb > 0.0:
+            filter = (lambda dirname: len(dirname) > BagtubeServer.STAMP_FORMAT_LENGTH and dirname[-BagtubeServer.STAMP_FORMAT_LENGTH - 1] == '-')
+            bag_dirnames = []
+            for dirname in os.listdir(self.bag_dir_path):
+                if os.path.isdir(os.path.join(self.bag_dir_path, dirname)) and filter(dirname):
+                    bag_dirnames.append(dirname)
+            bag_dirnames.sort(key=lambda dirname: dirname[-BagtubeServer.STAMP_FORMAT_LENGTH:], reverse=True)
+            total_size = 0
+            for dirname in bag_dirnames:
+                total_size += Info().read_metadata(os.path.join(self.bag_dir_path, dirname), BagtubeServer.DEFAULT_WRITER).bag_size
+
+            gb_to_bytes = 1024 * 1024 * 1024
+            if total_size > self.max_total_size_gb * gb_to_bytes:
+                for dirname in reversed(bag_dirnames):
+                    if total_size <= self.max_total_size_gb * gb_to_bytes:
+                        break
+                    self.get_logger().info(f"Deleting bag '{dirname}' to limit total size to {self.max_total_size_gb} GB")
+                    total_size -= Info().read_metadata(os.path.join(self.bag_dir_path, dirname), BagtubeServer.DEFAULT_WRITER).bag_size
+                    shutil.rmtree(os.path.join(self.bag_dir_path, dirname))
 
     #############################
     # Play bag action
