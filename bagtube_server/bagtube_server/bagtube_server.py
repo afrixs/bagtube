@@ -15,8 +15,11 @@ from bagtube_msgs.srv import ControlPlayback, GetBagList
 from bagtube_msgs.msg import BagInfo
 from rosgraph_msgs.msg import Clock
 from rcl_interfaces.msg import ParameterDescriptor
+from rosidl_runtime_py.utilities import get_message
+from rclpy.serialization import deserialize_message
 
-from rosbag2_py import StorageOptions, RecordOptions, Recorder, Player, Info
+from rosbag2_py import StorageOptions, RecordOptions, Recorder, Player, Info, SequentialReader, ReadOrder, ReadOrderSortBy, StorageFilter
+
 from bagtube_rosbag2_py import Player, PlayOptions
 from rosbag2_py import get_registered_writers
 
@@ -43,9 +46,12 @@ class BagtubeServer(Node):
 
         self.livestream_enabled = False
         self.recording_bag = False
+        self.snapshot_reader = None
+        self.snapshot_uri = None
 
         self.pipe_publishers = {}
         self.pipe_subscribers = {}
+        self.topic_pipes = {}
         self.input_nodes_running_services = {}
         self.topic_remappings = {}
         self.input_nodes_running_services_lock = threading.Lock()
@@ -56,6 +62,7 @@ class BagtubeServer(Node):
             output_topic = self.declare_parameter(f'{pipe}.output_topic', rclpy.Parameter.Type.STRING).get_parameter_value().string_value
 
             self.topic_remappings[input_topic] = output_topic
+            self.topic_pipes[input_topic] = pipe
 
             msg_type = self.load_message_type(type_str)
             if msg_type:
@@ -153,7 +160,7 @@ class BagtubeServer(Node):
             self.pipe_publishers[pipe].publish(msg)
 
     def get_bag_list_callback(self, request: GetBagList.Request, response: GetBagList.Response):
-        # return a list of bag directories whose names are in format '{name}-%y_%m_%d-%H_%M_%S.%f'
+        # return a list of bag directories whose names are in format '{name}-%Y_%m_%d-%H_%M_%S.%f'
         prefix = request.name + '-'
         required_len = len(prefix) + BagtubeServer.STAMP_FORMAT_LENGTH
         filter = (lambda dirname: len(dirname) >= required_len and dirname[-BagtubeServer.STAMP_FORMAT_LENGTH - 1] == '-')\
@@ -166,7 +173,8 @@ class BagtubeServer(Node):
 
         # extract the timestamp from the directory name
         for dirname in bag_dirnames:
-            nsec = int(datetime.datetime.strptime(dirname[-BagtubeServer.STAMP_FORMAT_LENGTH:], BagtubeServer.STAMP_FORMAT).timestamp()*1e9)
+            nsec = int(datetime.datetime.strptime(dirname[-BagtubeServer.STAMP_FORMAT_LENGTH:], BagtubeServer.STAMP_FORMAT)
+                       .replace(tzinfo=datetime.timezone.utc).timestamp()*1e9)
             bag = BagInfo()
             bag.name = dirname[:-BagtubeServer.STAMP_FORMAT_LENGTH - 1]
             bag.stamp = Time(nanoseconds=nsec).to_msg()
@@ -174,7 +182,7 @@ class BagtubeServer(Node):
             # get the duration of the bag
             info = Info()
             metadata = info.read_metadata(os.path.join(self.bag_dir_path, dirname), BagtubeServer.DEFAULT_WRITER)
-            bag.duration = metadata.duration.total_seconds()
+            bag.duration = metadata.duration.nanoseconds / 1e9
 
             response.bags.append(bag)
 
@@ -253,9 +261,10 @@ class BagtubeServer(Node):
                 self.get_logger().info(f"Bag is empty, deleting")
             else:
                 result.bag.name = record_bag_goal.name
-                nsec = int(datetime.datetime.strptime(bag_name[-BagtubeServer.STAMP_FORMAT_LENGTH:], BagtubeServer.STAMP_FORMAT).timestamp()*1e9)
+                nsec = int(datetime.datetime.strptime(bag_name[-BagtubeServer.STAMP_FORMAT_LENGTH:], BagtubeServer.STAMP_FORMAT)
+                           .replace(tzinfo=datetime.timezone.utc).timestamp()*1e9)
                 result.bag.stamp = Time(nanoseconds=nsec).to_msg()
-                result.bag.duration = metadata.duration.total_seconds()
+                result.bag.duration = metadata.duration.nanoseconds / 1e9
                 result.success = True
         else:
             result.success = False
@@ -308,12 +317,11 @@ class BagtubeServer(Node):
         play_bag_goal: PlayBag.Goal = goal_handle.request
 
         sec, nsec = Time.from_msg(play_bag_goal.stamp).seconds_nanoseconds()
-        bag_name = play_bag_goal.name + '-' + datetime.datetime.utcfromtimestamp(sec + nsec/1e9).strftime('%y_%m_%d-%H_%M_%S.%f')
+        bag_name = play_bag_goal.name + '-' + datetime.datetime.utcfromtimestamp(sec + nsec/1e9).strftime(BagtubeServer.STAMP_FORMAT)
         bag_path = os.path.join(self.bag_dir_path, bag_name)
 
         info = Info()
         metadata = info.read_metadata(bag_path, BagtubeServer.DEFAULT_WRITER)
-        start_time_nsec = int(metadata.starting_time.timestamp()*1e9)
 
         self.get_logger().info(f"Playing bag '{bag_path}' with duration {metadata.duration} seconds")
 
@@ -334,7 +342,7 @@ class BagtubeServer(Node):
         play_options.start_offset = play_bag_goal.start_offset
 
         with self.play_control_lock:
-            self.playback_start_time = Time(seconds=start_time_nsec // 1e9, nanoseconds=start_time_nsec % 1e9, clock_type=rclpy.clock.ClockType.ROS_TIME)
+            self.playback_start_time = Time(nanoseconds=metadata.starting_time.nanoseconds, clock_type=rclpy.clock.ClockType.ROS_TIME)
             self.playback_stamp = self.playback_start_time + Duration(seconds=play_bag_goal.start_offset)
             self.player = Player()
 
@@ -365,12 +373,30 @@ class BagtubeServer(Node):
             goal_handle.succeed()
         return result
 
-    def control_playback_callback(self, request, response):
+    def control_playback_callback(self, request: ControlPlayback.Request, response):
+        additional_message = ''
+        if request.command == ControlPlayback.Request.SEEK and (request.snapshot_bag_stamp.sec != 0 or request.snapshot_bag_stamp.nanosec != 0):
+            # get the snapshot bag path
+            sec, nsec = Time.from_msg(request.snapshot_bag_stamp).seconds_nanoseconds()
+            bag_name = request.snapshot_bag_name + '-' + datetime.datetime.utcfromtimestamp(sec + nsec/1e9).strftime(BagtubeServer.STAMP_FORMAT)
+            bag_path = os.path.join(self.bag_dir_path, bag_name)
+            if not os.path.exists(bag_path):
+                additional_message = "; snapshot bag does not exist, so no snapshot was published"
+            else:
+                # open the snapshot bag and find the last messages of each topic before the requested timestamp
+                info = Info()
+                metadata = info.read_metadata(bag_path, BagtubeServer.DEFAULT_WRITER)
+                snapshot_stamp = metadata.starting_time + Duration(seconds=request.offset)
+                snapshot_msgs = self.get_last_messages_before_timestamp(bag_path, snapshot_stamp)
+                for topic in snapshot_msgs:
+                    self.pipe_publishers[self.topic_pipes[topic]].publish(snapshot_msgs[topic])
+                additional_message = f"; sent snapshot for {len(snapshot_msgs)} topics"
+
         with self.play_control_lock:
             if not hasattr(self, 'player') or self.player is None:
-                self.get_logger().error(f"Playback control requested but no bag is playing")
+                self.get_logger().error(f"Playback control requested but no bag is playing" + additional_message)
                 response.success = False
-                response.message = f"Playback control requested but no bag is playing"
+                response.message = f"Playback control requested but no bag is playing" + additional_message
                 return response
             if request.command == ControlPlayback.Request.PAUSE:
                 self.player.pause()
@@ -380,13 +406,58 @@ class BagtubeServer(Node):
             elif request.command == ControlPlayback.Request.SEEK:
                 self.player.seek((self.playback_start_time + rclpy.time.Duration(seconds=request.offset)).nanoseconds)
             else:
-                self.get_logger().error(f"Invalid playback command: {request.command}")
+                self.get_logger().error(f"Invalid playback command: {request.command}" + additional_message)
                 response.success = False
-                response.message = f"Invalid playback command: {request.command}"
+                response.message = f"Invalid playback command: {request.command}" + additional_message
                 return response
         response.success = True
-        response.message = f"Playback command '{request.command}' successful"
+        response.message = f"Playback command '{request.command}' successful" + additional_message
         return response
+
+    def get_last_messages_before_timestamp(self, bag_path, target_timestamp):
+        last_messages = {}
+        if self.snapshot_uri != bag_path:
+            # Open the bag
+            reader = SequentialReader()
+            reader.open_uri(bag_path)
+
+            # Set the read order to reverse because we want the last message before the target timestamp
+            read_order = ReadOrder()
+            read_order.sort_by = ReadOrderSortBy.ReceivedTimestamp
+            read_order.reverse = True
+            reader.set_read_order(read_order)
+
+            topics_meta_list = reader.get_all_topics_and_types()
+            topics_meta = {topic.name : topic for topic in topics_meta_list}
+            filtered_topics = [topic for topic in self.topic_remappings if topic in topics_meta]
+            filter = StorageFilter()
+            filter.topics = filtered_topics
+            reader.set_filter(filter)
+
+            self.snapshot_uri = bag_path
+            self.snapshot_reader = reader
+            self.snapshot_filtered_topics = filtered_topics
+            self.snapshot_topics_meta = topics_meta
+        else:
+            reader = self.snapshot_reader
+            topics_meta = self.snapshot_topics_meta
+            filtered_topics = self.snapshot_filtered_topics
+
+        reader.seek(target_timestamp.nanoseconds)
+
+        # Iterate through the messages in the bag
+        while reader.has_next():
+            topic, data, _ = reader.read_next()  # read_next() returns (type_map index, serialized_message, timestamp)
+            topic_meta = topics_meta[topic]
+
+            if not (topic_meta.name in last_messages):
+                msg_type = get_message(topic_meta.type)
+                msg = deserialize_message(data, msg_type)
+                last_messages[topic] = msg
+                if len(last_messages) == len(filtered_topics):
+                    break
+
+        return last_messages
 
 def main(args=None):
     rclpy.init(args=args)

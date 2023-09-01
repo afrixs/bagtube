@@ -4,6 +4,8 @@ uint32 SEEK=2
 
 uint32 command
 float64 offset  # for SEEK action
+string snapshot_bag_name  # for SEEK action
+builtin_interfaces/Time snapshot_bag_stamp  # for SEEK action, leave zero if no snapshot should be sent
 
 ---
 bool success
