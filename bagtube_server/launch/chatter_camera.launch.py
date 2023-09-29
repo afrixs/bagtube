@@ -17,6 +17,12 @@ def generate_launch_description():
       executable='talker',
       name='talker',
     ),
+    Node(
+      package='rviz2',
+      executable='rviz2',
+      name='rviz2',
+      arguments=['-d', os.path.join(pkg_dir, 'rviz', 'chatter_camera.rviz')],
+    ),
 
     Node(
       package='bagtube_server',
