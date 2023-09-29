@@ -344,19 +344,21 @@ class BagtubeServer(Node):
         with self.play_control_lock:
             self.playback_start_time = Time(nanoseconds=metadata.starting_time.nanoseconds, clock_type=rclpy.clock.ClockType.ROS_TIME)
             self.playback_stamp = self.playback_start_time + Duration(seconds=play_bag_goal.start_offset)
-            self.player = Player()
+            self.player = Player(storage_options, play_options)
 
         play_thread = threading.Thread(
             target=self.player.play,
-            args=(storage_options, play_options),
             daemon=True)
 
         play_thread.start()
+        feedback = PlayBag.Feedback()
+        feedback.current_offset = -1.0  # make sure the first feedback is published
         while rclpy.ok() and not goal_handle.is_cancel_requested and not self.player.has_finished():
-            feedback = PlayBag.Feedback()
             with self.play_control_lock:
-                feedback.current_offset = (self.playback_stamp - self.playback_start_time).nanoseconds / 1e9
-            goal_handle.publish_feedback(feedback)
+                current_offset = (self.playback_stamp - self.playback_start_time).nanoseconds / 1e9
+            if feedback.current_offset != current_offset:
+                feedback.current_offset = current_offset
+                goal_handle.publish_feedback(feedback)
             self.get_clock().sleep_for(Duration(seconds=0.1))
         with self.play_control_lock:
             self.player.cancel()
@@ -364,7 +366,7 @@ class BagtubeServer(Node):
 
         result = PlayBag.Result()
         with self.play_control_lock:
-            result.stop_offset = (self.playback_stamp - self.playback_start_time).nanoseconds / 1e9  # TODO: subscribe to clock and use that instead
+            result.stop_offset = (self.playback_stamp - self.playback_start_time).nanoseconds / 1e9
             self.player = None
         self.get_logger().info(f"Playing finished after {result.stop_offset} seconds")
         if goal_handle.is_cancel_requested:
@@ -393,7 +395,7 @@ class BagtubeServer(Node):
                 additional_message = f"; sent snapshot for {len(snapshot_msgs)} topics"
 
         with self.play_control_lock:
-            if not hasattr(self, 'player') or self.player is None:
+            if not hasattr(self, 'player') or self.player is None or self.player.has_finished():
                 self.get_logger().error(f"Playback control requested but no bag is playing" + additional_message)
                 response.success = False
                 response.message = f"Playback control requested but no bag is playing" + additional_message

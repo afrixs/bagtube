@@ -106,25 +106,52 @@ class Player
 private:
   std::shared_ptr<rosbag2_transport::Player> player_;
   bool has_finished_ = false;
+  std::thread play_thread_;
 public:
-  Player()
+  Player(const rosbag2_storage::StorageOptions & storage_options,
+         PlayOptions & play_options)
   {
-    rclcpp::init(0, nullptr);
+    try {
+      rclcpp::init(0, nullptr);
+    } catch (...) {
+      RCLCPP_ERROR(rclcpp::get_logger("rosbag2_py"), "Failed to initialize rclcpp (seems to be already running for some reason)");
+    }
+    auto reader = rosbag2_transport::ReaderWriterFactory::make_reader(storage_options);
+
+    // NOTE: this is a workaround for a bug in rosbag2_transport where the start offset is
+    // preventing seeking to a time before the start offset.
+    reader->open(storage_options.uri);
+    auto start_time = reader->get_metadata().starting_time;
+    double start_offset = play_options.getStartOffset();
+    play_options.setStartOffset(0.0);
+    play_options.start_paused = true;
+
+    player_ = std::make_shared<rosbag2_transport::Player>(
+        std::move(reader), storage_options, play_options);
+
+    // need to be called here, so we can use player_->seek(). We use start_paused and in play() we just call resume()
+    has_finished_ = false;
+    play_thread_ = std::thread(
+        [&]() {
+          player_->play();
+          has_finished_ = true;
+        });
+
+    // seek to the start offset
+    RCLCPP_INFO(player_->get_logger(), "Seeking to start offset %f", start_offset);
+    player_->seek(start_time.time_since_epoch().count() + static_cast<rcutils_time_point_value_t>(RCUTILS_S_TO_NS(start_offset)));
+    RCLCPP_INFO(player_->get_logger(), "Seeked");
   }
 
   virtual ~Player()
   {
+    RCLCPP_INFO(player_->get_logger(), "Shutting down rclcpp");
     rclcpp::shutdown();
   }
 
-  void play(
-      const rosbag2_storage::StorageOptions & storage_options,
-      PlayOptions & play_options)
+  void play()
   {
-    has_finished_ = false;
-    auto reader = rosbag2_transport::ReaderWriterFactory::make_reader(storage_options);
-    player_ = std::make_shared<rosbag2_transport::Player>(
-        std::move(reader), storage_options, play_options);
+    player_->resume();
 
     rclcpp::executors::SingleThreadedExecutor exec;
     exec.add_node(player_);
@@ -133,25 +160,18 @@ public:
           exec.spin();
         });
 
-    // need to be called in a separate thread so that the GIL can be released periodically
-    auto play_thread = std::thread(
-        [&]() {
-          player_->play();
-          has_finished_ = true;
-        });
-
     while (!has_finished_) {
       py::gil_scoped_release release;
       rclcpp::sleep_for(std::chrono::milliseconds(100));
     }
     exec.cancel();
     spin_thread.join();
-    play_thread.join();
+    play_thread_.join();
   }
 
   void cancel()
   {
-    player_.reset();
+    player_->stop();
   }
 
   void pause()
@@ -214,7 +234,7 @@ py::class_<PlayOptions>(m, "PlayOptions")
 ;
 
 py::class_<bagtube_rosbag2_py::Player>(m, "Player")
-.def(py::init())
+.def(py::init<const rosbag2_storage::StorageOptions &, PlayOptions &>())
 .def("play", &bagtube_rosbag2_py::Player::play)
 .def("cancel", &bagtube_rosbag2_py::Player::cancel)
 .def("pause", &bagtube_rosbag2_py::Player::pause)
