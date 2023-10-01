@@ -9,6 +9,7 @@
 #include <rviz_common/panel.hpp>
 #include "rviz_common/ros_integration/ros_node_abstraction_iface.hpp"
 #include "bagtube_msgs/srv/get_bag_list.hpp"
+#include "bagtube_msgs/srv/edit_bag.hpp"
 #include "bagtube_msgs/srv/control_playback.hpp"
 #include "bagtube_msgs/action/play_bag.hpp"
 #include "bagtube_msgs/action/record_bag.hpp"
@@ -20,8 +21,22 @@
 #include <QLineEdit>
 #include <QLabel>
 #include <QPushButton>
+#include <QComboBox>
 
 namespace bagtube_rviz_plugins {
+
+class BagtubeTableWidget : public QTableWidget {
+Q_OBJECT
+public:
+  void mouseReleaseEvent(QMouseEvent *event) override;
+
+Q_SIGNALS:
+  void deletePressed(int row, int column);
+
+protected:
+  void keyPressEvent(QKeyEvent *e);
+};
+
 
 class BagtubePanel : public rviz_common::Panel {
   Q_OBJECT
@@ -39,13 +54,16 @@ public:
 protected Q_SLOTS:
 
   void onBagSelected(int row, int column);
+  void onBagNameEdited(int row, int column);
   void onBagsFilterChanged();
   void onPlaybackSliderChanged(int value);
+  void onPlaybackSpeedChanged(int);
   void onPlayPauseButtonClicked();
   void onLivestreamButtonClicked(bool checked);
   void onRecordNameChanged(const QString &text);
   void onRecordButtonClicked(bool checked);
   void reloadBags();
+  void onBagDelete(int row, int column);
 protected:
 
   rviz_common::ros_integration::RosNodeAbstractionIface::WeakPtr rviz_ros_node_;
@@ -53,6 +71,7 @@ protected:
   rclcpp::CallbackGroup::SharedPtr sync_response_cb_group_;
 
   rclcpp::Client<bagtube_msgs::srv::GetBagList>::SharedPtr list_bags_cl_;
+  rclcpp::Client<bagtube_msgs::srv::EditBag>::SharedPtr edit_bag_cl_;
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr livestream_cl_;
   rclcpp::Client<bagtube_msgs::srv::ControlPlayback>::SharedPtr control_playback_cl_;
   rclcpp_action::Client<bagtube_msgs::action::PlayBag>::SharedPtr play_bag_ac_;
@@ -72,6 +91,7 @@ protected:
   QSlider* playback_slider_;
   QLabel* playback_time_label_;
   QLabel* playback_duration_label_;
+  QComboBox* playback_speed_combo_;
   QPushButton *play_pause_button_;
 
   QTableWidget* bags_table_;

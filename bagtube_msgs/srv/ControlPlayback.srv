@@ -1,13 +1,15 @@
 uint32 PAUSE=0
 uint32 RESUME=1
 uint32 SEEK=2
+uint32 SET_RATE=3
 
 uint32 command
-float64 offset  # for SEEK action
-string snapshot_bag_name  # for SEEK action
-builtin_interfaces/Time snapshot_bag_stamp  # for SEEK action, leave zero if no snapshot should be sent
+float64 rate  # for SET_RATE command
+float64 offset  # for SEEK command
+string snapshot_bag_name  # for SEEK command
+builtin_interfaces/Time snapshot_bag_stamp  # for SEEK command, leave zero if no snapshot should be sent
 
 ---
 bool success
 string message
-float64 current_offset  # for PAUSE action
+float64 current_offset  # for PAUSE command

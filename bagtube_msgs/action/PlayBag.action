@@ -2,6 +2,7 @@
 string name
 builtin_interfaces/Time stamp
 float64 start_offset
+float64 rate
 ---
 # result
 float64 stop_offset

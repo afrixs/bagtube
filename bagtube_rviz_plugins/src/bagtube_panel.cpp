@@ -27,21 +27,27 @@ public:
   }
 };
 
-class DeselectableTableWidget : public QTableWidget {
-public:
-  void mouseReleaseEvent(QMouseEvent *event) override {
-    if (event->button() == Qt::MouseButton::LeftButton) {
-      auto item = itemAt(event->pos());
-      if (item == nullptr) {
-        clearSelection();
-        emit cellClicked(-1, -1);
-      }
-    }
-    QTableWidget::mouseReleaseEvent(event);
-  }
-};
-
 namespace bagtube_rviz_plugins {
+
+void BagtubeTableWidget::mouseReleaseEvent(QMouseEvent *event)
+{
+  if (event->button() == Qt::MouseButton::LeftButton) {
+    auto item = itemAt(event->pos());
+    if (item == nullptr) {
+      clearSelection();
+      emit cellClicked(-1, -1);
+    }
+  }
+  QTableWidget::mouseReleaseEvent(event);
+}
+void BagtubeTableWidget::keyPressEvent(QKeyEvent *e)
+{
+  if(e->key()==Qt::Key_Delete)
+  {
+    emit deletePressed(this->currentRow(),this->currentColumn());
+  }
+  else { QTableWidget::keyPressEvent(e); }
+}
 
 BagtubePanel::BagtubePanel(QWidget *parent)
     : rviz_common::Panel(parent) {
@@ -70,11 +76,13 @@ BagtubePanel::BagtubePanel(QWidget *parent)
   layout->addLayout(livestream_layout);
 
   // bags list
-  bags_table_ = new DeselectableTableWidget;
+  bags_table_ = new BagtubeTableWidget;
   bags_table_->setColumnCount(3);
   bags_table_->setHorizontalHeaderLabels({"Name", "Timestamp", "Duration"});
   bags_table_->setSelectionBehavior(QAbstractItemView::SelectionBehavior::SelectRows);
   connect(bags_table_, SIGNAL(cellClicked(int, int)), this, SLOT(onBagSelected(int, int)));
+  connect(bags_table_, SIGNAL(deletePressed(int, int)), this, SLOT(onBagDelete(int, int)));
+  connect(bags_table_, SIGNAL(cellChanged(int, int)), this, SLOT(onBagNameEdited(int, int)));
   layout->addWidget(bags_table_);
 
   auto bags_control_layout = new QHBoxLayout;
@@ -111,6 +119,12 @@ BagtubePanel::BagtubePanel(QWidget *parent)
   play_pause_button_->setEnabled(false);
 
   playback_control_layout->addStretch();
+  playback_speed_combo_ = new QComboBox;
+  playback_speed_combo_->addItems({"0.25x", "0.5x", "1x", "2x", "4x", "8x", "16x"});
+  playback_speed_combo_->setCurrentIndex(2);
+  connect(playback_speed_combo_, SIGNAL(currentIndexChanged(int)), this, SLOT(onPlaybackSpeedChanged(int)));
+  playback_control_layout->addWidget(playback_speed_combo_);
+
   playback_duration_label_ = new QLabel(durationToString(0.0));
   playback_control_layout->addWidget(playback_duration_label_);
 
@@ -129,6 +143,12 @@ void BagtubePanel::onInitialize() {
 
   list_bags_cl_ = node->create_client<bagtube_msgs::srv::GetBagList>(
       "get_bag_list",
+      rclcpp::ServicesQoS(),
+      sync_response_cb_group_
+  );
+
+  edit_bag_cl_ = node->create_client<bagtube_msgs::srv::EditBag>(
+      "edit_bag",
       rclcpp::ServicesQoS(),
       sync_response_cb_group_
   );
@@ -168,6 +188,7 @@ void BagtubePanel::save(rviz_common::Config config) const {
   rviz_common::Panel::save(config);
   config.mapSetValue( "Record name", record_name_edit_->text() );
   config.mapSetValue( "Filter name", bags_filter_edit_->text() );
+  config.mapSetValue( "Playback rate", playback_speed_combo_->currentText() );
 }
 
 // Load all configuration data for this panel from the given Config object.
@@ -180,13 +201,16 @@ void BagtubePanel::load(const rviz_common::Config &config) {
   QString filter_name;
   if (config.mapGetString( "Filter name", &filter_name ))
     bags_filter_edit_->setText( filter_name );
+  QString playback_rate;
+  if (config.mapGetString( "Playback rate", &playback_rate ))
+    playback_speed_combo_->setCurrentText( playback_rate );
 
   reloadBags();
 }
 
 QString BagtubePanel::durationToString(double duration) {
   // convert from rclcpp::Duration to hh:mm:ss.sss
-  char buf[20];
+  char buf[30];
   snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d",
            (int)duration/3600, ((int)duration%3600)/60, (int)duration%60,
            (int)(duration*1000)%1000);
@@ -256,9 +280,54 @@ void BagtubePanel::onBagSelected(int row, int /*column*/) {
   }
 }
 
+void BagtubePanel::onBagDelete(int row, int /*column*/)
+{
+  std::unique_lock<std::recursive_mutex> lock(action_mutex_);
+  if (row < 0 || row >= static_cast<int>(bags_.size()))
+    return;
+  if (play_bag_goal_handle_)
+    play_bag_ac_->async_cancel_goal(play_bag_goal_handle_);
+
+  auto request = std::make_shared<bagtube_msgs::srv::EditBag::Request>();
+  request->command = bagtube_msgs::srv::EditBag::Request::DELETE;
+  request->name = bags_[row].name;
+  request->stamp = bags_[row].stamp;
+  if (auto response = callService<bagtube_msgs::srv::EditBag>(edit_bag_cl_, request); response && response->success) {
+    reloadBags();
+    onBagSelected(bags_table_->currentRow(), bags_table_->currentColumn());
+  }
+  else
+    RCLCPP_ERROR(LOGGER, "Failed to delete bag: %s", response->message.c_str());
+}
+
+void BagtubePanel::onBagNameEdited(int row, int column)
+{
+  std::unique_lock<std::recursive_mutex> lock(action_mutex_);
+  if (row < 0 || row >= static_cast<int>(bags_.size()))
+    return;
+  std::string new_name = bags_table_->item(row, column)->text().toStdString();
+  if (new_name == bags_[row].name || new_name.empty()) {
+    bags_table_->item(row, column)->setText(QString::fromStdString(bags_[row].name));
+    return;
+  }
+  if (play_bag_goal_handle_)
+    play_bag_ac_->async_cancel_goal(play_bag_goal_handle_);
+
+  auto request = std::make_shared<bagtube_msgs::srv::EditBag::Request>();
+  request->command = bagtube_msgs::srv::EditBag::Request::RENAME;
+  request->name = bags_[row].name;
+  request->stamp = bags_[row].stamp;
+  request->new_name = new_name;
+  if (auto response = callService<bagtube_msgs::srv::EditBag>(edit_bag_cl_, request); response && response->success)
+    bags_[row].name = new_name;
+  else
+    RCLCPP_ERROR(LOGGER, "Failed to rename bag: %s", response->message.c_str());
+}
+
 void BagtubePanel::reloadBags()
 {
   std::unique_lock<std::recursive_mutex> lock(action_mutex_);
+  bags_table_->blockSignals(true);
   auto request = std::make_shared<bagtube_msgs::srv::GetBagList::Request>();
   request->name = bags_filter_edit_->text().toStdString();
   if (auto response = callService<bagtube_msgs::srv::GetBagList>(list_bags_cl_, request)) {
@@ -267,7 +336,7 @@ void BagtubePanel::reloadBags()
     for (size_t i = 0; i < response->bags.size(); ++i) {
       auto &bag = response->bags[i];
       auto name_item = new QTableWidgetItem(QString::fromStdString(bag.name));
-      name_item->setFlags(name_item->flags() & ~Qt::ItemIsEditable);
+      name_item->setFlags(name_item->flags() | Qt::ItemIsEditable);
       bags_table_->setItem(i, 0, name_item);
 
       {
@@ -276,7 +345,7 @@ void BagtubePanel::reloadBags()
             std::chrono::seconds(bag.stamp.sec) + std::chrono::nanoseconds(bag.stamp.nanosec));
         auto time_t = std::chrono::system_clock::to_time_t(time);
         auto tm = std::localtime(&time_t);
-        char buf[20];
+        char buf[30];
         strftime(buf, sizeof(buf), "%F %T", tm);
         auto stamp_item = new QTableWidgetItem(buf);
         stamp_item->setFlags(stamp_item->flags() & ~Qt::ItemIsEditable);
@@ -298,6 +367,7 @@ void BagtubePanel::reloadBags()
     }
   }
   bags_table_->resizeColumnsToContents();
+  bags_table_->blockSignals(false);
 }
 
 void BagtubePanel::onBagsFilterChanged() {
@@ -429,6 +499,8 @@ void BagtubePanel::onPlayPauseButtonClicked() {
     bagtube_msgs::action::PlayBag::Goal goal;
     goal.stamp = selected_bag_.stamp;
     goal.name = selected_bag_.name;
+    std::string rate_str = playback_speed_combo_->itemText(playback_speed_combo_->currentIndex()).toStdString();
+    goal.rate = std::stod(rate_str.substr(0, rate_str.size()-1));
     goal.start_offset = playback_slider_->value()/1000.0;
     play_bag_ac_->async_send_goal(goal, send_goal_opts);
   }
@@ -499,10 +571,27 @@ void BagtubePanel::onRecordButtonClicked(bool checked) {
 }
 
 void BagtubePanel::onLivestreamEnabledChanged() {
+  std::unique_lock<std::recursive_mutex> lock(action_mutex_);
   record_name_edit_->setVisible(livestream_button_->isChecked());
   record_button_->setVisible(livestream_button_->isChecked());
   if (!livestream_button_->isChecked() && record_bag_goal_handle_)
     record_bag_ac_->async_cancel_goal(record_bag_goal_handle_);
+}
+
+void BagtubePanel::onPlaybackSpeedChanged(int index) {
+  std::unique_lock<std::recursive_mutex> lock(action_mutex_);
+  Q_EMIT configChanged();
+  if (!play_bag_goal_handle_)
+    return;
+
+  auto request = std::make_shared<bagtube_msgs::srv::ControlPlayback::Request>();
+  request->command = bagtube_msgs::srv::ControlPlayback::Request::SET_RATE;
+  std::string rate_str = playback_speed_combo_->itemText(index).toStdString();
+  request->rate = std::stod(rate_str.substr(0, rate_str.size()-1));
+  if (auto response = callService<bagtube_msgs::srv::ControlPlayback>(control_playback_cl_, request); response && response->success) {
+    // do nothing
+  } else
+    RCLCPP_ERROR(LOGGER, "Failed to set playback rate");
 }
 
 } // bagtube_rviz_plugins

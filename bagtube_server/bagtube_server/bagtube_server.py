@@ -11,7 +11,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from std_srvs.srv import SetBool
 from bagtube_msgs.action import RecordBag, PlayBag
-from bagtube_msgs.srv import ControlPlayback, GetBagList
+from bagtube_msgs.srv import ControlPlayback, GetBagList, EditBag
 from bagtube_msgs.msg import BagInfo
 from rosgraph_msgs.msg import Clock
 from rcl_interfaces.msg import ParameterDescriptor
@@ -87,6 +87,7 @@ class BagtubeServer(Node):
             self.toggle_input_nodes_services[service_name] = self.create_client(SetBool, service_name, callback_group=self.sync_service_callback_group)
 
         self.get_bag_list_service = self.create_service(GetBagList, 'get_bag_list', self.get_bag_list_callback)
+        self.edit_bag_service = self.create_service(EditBag, 'edit_bag', self.edit_bag_callback)
 
         self.record_server = ActionServer(
             self,
@@ -188,6 +189,35 @@ class BagtubeServer(Node):
 
         # sort the bags by timestamp
         response.bags.sort(key=lambda bag: bag.stamp.sec + bag.stamp.nanosec/1e9)
+        return response
+
+    def edit_bag_callback(self, request: EditBag.Request, response: EditBag.Response):
+        sec, nsec = Time.from_msg(request.stamp).seconds_nanoseconds()
+        date_string = datetime.datetime.utcfromtimestamp(sec + nsec/1e9).strftime(BagtubeServer.STAMP_FORMAT)
+        bag_name = request.name + '-' + date_string
+        # rename the bag directory
+        if request.command == EditBag.Request.RENAME:
+            old_bag_name = bag_name
+            old_bag_path = os.path.join(self.bag_dir_path, old_bag_name)
+            new_bag_name = request.new_name + '-' + date_string
+            new_bag_path = os.path.join(self.bag_dir_path, new_bag_name)
+            if os.path.exists(old_bag_path):
+                os.rename(old_bag_path, new_bag_path)
+                response.success = True
+                response.message = f"Bag renamed from '{old_bag_name}' to '{new_bag_name}'"
+            else:
+                response.success = False
+                response.message = f"Bag '{old_bag_name}' does not exist"
+        elif request.command == EditBag.Request.DELETE:
+            bag_name = bag_name
+            bag_path = os.path.join(self.bag_dir_path, bag_name)
+            if os.path.exists(bag_path):
+                shutil.rmtree(bag_path)
+                response.success = True
+                response.message = f"Bag deleted: '{bag_name}'"
+            else:
+                response.success = False
+                response.message = f"Bag '{bag_name}' does not exist"
         return response
 
     #############################
@@ -340,6 +370,7 @@ class BagtubeServer(Node):
         play_options.disable_keyboard_controls = True
         play_options.clock_publish_frequency = 100
         play_options.start_offset = play_bag_goal.start_offset
+        play_options.rate = play_bag_goal.rate
 
         with self.play_control_lock:
             self.playback_start_time = Time(nanoseconds=metadata.starting_time.nanoseconds, clock_type=rclpy.clock.ClockType.ROS_TIME)
@@ -407,6 +438,8 @@ class BagtubeServer(Node):
                 self.player.resume()
             elif request.command == ControlPlayback.Request.SEEK:
                 self.player.seek((self.playback_start_time + rclpy.time.Duration(seconds=request.offset)).nanoseconds)
+            elif request.command == ControlPlayback.Request.SET_RATE:
+                self.player.set_rate(request.rate)
             else:
                 self.get_logger().error(f"Invalid playback command: {request.command}" + additional_message)
                 response.success = False

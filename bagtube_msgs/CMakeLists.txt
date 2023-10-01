@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/PlayBag.action"
   "msg/BagInfo.msg"
   "srv/ControlPlayback.srv"
+  "srv/EditBag.srv"
   "srv/GetBagList.srv"
   DEPENDENCIES ${dependencies}
 )

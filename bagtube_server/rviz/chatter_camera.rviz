@@ -27,9 +27,10 @@ Panels:
     SyncMode: 0
     SyncSource: ""
   - Class: bagtube_rviz_plugins/BagtubePanel
-    Filter name: pokus
+    Filter name: ""
     Name: BagtubePanel
-    Record name: watering_monstera
+    Playback rate: 1x
+    Record name: ""
 Visualization Manager:
   Class: ""
   Displays:

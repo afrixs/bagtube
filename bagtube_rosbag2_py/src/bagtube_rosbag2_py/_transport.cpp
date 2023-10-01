@@ -189,6 +189,11 @@ public:
     return has_finished_;
   }
 
+  void set_rate(double rate)
+  {
+    player_->set_rate(rate);
+  }
+
   void seek(rcutils_time_point_value_t time)
   {
     player_->seek(time);
@@ -240,6 +245,7 @@ py::class_<bagtube_rosbag2_py::Player>(m, "Player")
 .def("pause", &bagtube_rosbag2_py::Player::pause)
 .def("resume", &bagtube_rosbag2_py::Player::resume)
 .def("seek", &bagtube_rosbag2_py::Player::seek, py::arg("time"))
+.def("set_rate", &bagtube_rosbag2_py::Player::set_rate, py::arg("rate"))
 .def("has_finished", &bagtube_rosbag2_py::Player::has_finished)
 ;
 
