@@ -11,17 +11,20 @@ def generate_launch_description():
       package='usb_cam',
       executable='usb_cam_node_exe',
       name='usb_cam',
+      output='screen',
     ),
     Node(
       package='demo_nodes_cpp',
       executable='talker',
       name='talker',
+      output='screen',
     ),
     Node(
       package='rviz2',
       executable='rviz2',
       name='rviz2',
       arguments=['-d', os.path.join(pkg_dir, 'rviz', 'chatter_camera.rviz')],
+      output='screen',
     ),
 
     Node(
@@ -31,5 +34,6 @@ def generate_launch_description():
       parameters=[
         os.path.join(pkg_dir, 'params', 'chatter_camera.yaml'),
       ],
+      output='screen',
     ),
   ])
