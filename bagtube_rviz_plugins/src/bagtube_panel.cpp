@@ -135,7 +135,8 @@ BagtubePanel::BagtubePanel(QWidget *parent)
 
 void BagtubePanel::onInitialize() {
   rviz_ros_node_ = getDisplayContext()->getRosNodeAbstraction();
-  auto node = rviz_ros_node_.lock()->get_raw_node();
+  auto node_lock = rviz_ros_node_.lock();
+  auto node = node_lock->get_raw_node();
 
   sync_response_executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
   sync_response_cb_group_ = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
@@ -423,7 +424,8 @@ void BagtubePanel::onPlayPauseButtonClicked() {
     play_pause_button_->setText("❚❚");
     play_pause_button_->setEnabled(false);
 
-    auto node = rviz_ros_node_.lock()->get_raw_node();
+    auto node_lock = rviz_ros_node_.lock();
+    auto node = node_lock->get_raw_node();
     play_bag_ac_->wait_for_action_server(0.8s);
     if (!play_bag_ac_->action_server_is_ready()) {
       RCLCPP_ERROR(LOGGER, "Playback action server not available after waiting");
@@ -532,7 +534,8 @@ void BagtubePanel::onRecordButtonClicked(bool checked) {
   if (checked) {
     if (record_bag_goal_handle_)
       record_bag_ac_->async_cancel_goal(record_bag_goal_handle_);
-    auto node = rviz_ros_node_.lock()->get_raw_node();
+    auto node_lock = rviz_ros_node_.lock();
+    auto node = node_lock->get_raw_node();
     record_bag_ac_->wait_for_action_server(0.8s);
     if (!record_bag_ac_->action_server_is_ready()) {
       RCLCPP_ERROR(LOGGER, "Record action server not available after waiting");

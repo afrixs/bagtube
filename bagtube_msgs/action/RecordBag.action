@@ -9,3 +9,4 @@ BagInfo bag
 ---
 # feedback
 float64 current_duration
+bool queued

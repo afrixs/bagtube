@@ -18,9 +18,9 @@ from rcl_interfaces.msg import ParameterDescriptor
 from rosidl_runtime_py.utilities import get_message
 from rclpy.serialization import deserialize_message
 
-from rosbag2_py import StorageOptions, RecordOptions, Recorder, Player, Info, SequentialReader, ReadOrder, ReadOrderSortBy, StorageFilter
+from rosbag2_py import StorageOptions, Player, Info, SequentialReader, ReadOrder, ReadOrderSortBy, StorageFilter
 
-from bagtube_rosbag2_py import Player, PlayOptions
+from bagtube_rosbag2_py import Player, PlayOptions, RecordOptions, Recorder, init_rclcpp, shutdown_rclcpp
 from rosbag2_py import get_registered_writers
 
 
@@ -99,6 +99,10 @@ class BagtubeServer(Node):
             callback_group=MutuallyExclusiveCallbackGroup()
         )
 
+        self.canceled_recordings = []  # cannot be a set() because UUIDs are not hashable
+        self.recordings_queue = []
+        self.recordings_queue_condition = threading.Condition()
+
         self.play_control_lock = threading.Lock()
         self.clock_subscriber = self.create_subscription(Clock, 'clock', self.clock_callback, QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.play_server = ActionServer(
@@ -113,6 +117,7 @@ class BagtubeServer(Node):
         self.control_playback_service = self.create_service(ControlPlayback, 'control_playback', self.control_playback_callback)
 
         self.init_timer = self.create_timer(0.0, self.init_timer_callback)
+        init_rclcpp()
 
     def init_timer_callback(self):
         self.init_timer.cancel()
@@ -228,10 +233,27 @@ class BagtubeServer(Node):
 
     def record_cancel_callback(self, goal_handle):
         self.get_logger().info(f"Record goal {goal_handle.goal_id} canceled")
+        with self.recordings_queue_condition:
+            if goal_handle.is_active:
+                self.canceled_recordings.append(goal_handle.goal_id)
+                self.recordings_queue_condition.notify_all()
         return CancelResponse.ACCEPT
 
     def record_bag_callback(self, goal_handle):
         record_bag_goal = goal_handle.request
+
+        with (self.recordings_queue_condition):
+            self.recordings_queue.append(goal_handle.goal_id)
+            if len(self.recordings_queue) > 1:
+                self.get_logger().info(f"RecordBag goal {goal_handle.goal_id} queued "
+                                       f"(multiple recordings at a time are not supported currently)")
+                feedback = RecordBag.Feedback()
+                feedback.queued = True
+                goal_handle.publish_feedback(feedback)
+
+                while rclpy.ok() and not (goal_handle.is_cancel_requested or goal_handle.goal_id in self.canceled_recordings)\
+                      and self.recordings_queue[0] != goal_handle.goal_id:
+                    self.recordings_queue_condition.wait()
 
         bag_name = record_bag_goal.name + '-' + datetime.datetime.utcnow().strftime(BagtubeServer.STAMP_FORMAT)
         bag_path = os.path.join(self.bag_dir_path, bag_name)
@@ -301,10 +323,19 @@ class BagtubeServer(Node):
             result.message = f"Bag file does not exist (it was probably deleted due to size limit)"
             self.get_logger().info(f"Bag file does not exist (it was probably deleted due to size limit)")
 
-        if goal_handle.is_cancel_requested:
-            goal_handle.canceled()
-        else:
-            goal_handle.succeed()
+        with self.recordings_queue_condition:
+            self.recordings_queue.remove(goal_handle.goal_id)
+            self.recordings_queue_condition.notify_all()
+
+            # must be inside the condition lock to prevent adding the uuid to canceled_recordings after the job is done
+            try:
+                self.canceled_recordings.remove(goal_handle.goal_id)
+            except ValueError:
+                pass
+            if goal_handle.is_cancel_requested:
+                goal_handle.canceled()
+            else:
+                goal_handle.succeed()
         return result
 
     def limit_total_size(self):
@@ -497,7 +528,7 @@ class BagtubeServer(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = BagtubeServer()
-    executor = MultiThreadedExecutor(4)
+    executor = MultiThreadedExecutor(12)
     executor.add_node(node)
     try:
         node.get_logger().info('Beginning client, shut down with CTRL-C')
@@ -506,6 +537,7 @@ def main(args=None):
         node.get_logger().info('Keyboard interrupt, shutting down.\n')
     node.destroy_node()
     rclpy.shutdown()
+    shutdown_rclcpp()
 
 if __name__ == '__main__':
     main()

@@ -20,10 +20,18 @@ from rpyutils import add_dll_directories_from_env
 with add_dll_directories_from_env('PATH'):
   from bagtube_rosbag2_py._transport import (
     Player,
-    PlayOptions
+    PlayOptions,
+    Recorder,
+    RecordOptions,
+    init_rclcpp,
+    shutdown_rclcpp
   )
 
 __all__ = [
   'Player',
-  'PlayOptions'
+  'PlayOptions',
+  'Recorder',
+  'RecordOptions',
+  'init_rclcpp',
+  'shutdown_rclcpp'
 ]
