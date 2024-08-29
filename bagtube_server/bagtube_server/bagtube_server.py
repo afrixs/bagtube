@@ -186,11 +186,14 @@ class BagtubeServer(Node):
             bag.stamp = Time(nanoseconds=nsec).to_msg()
 
             # get the duration of the bag
-            info = Info()
-            metadata = info.read_metadata(os.path.join(self.bag_dir_path, dirname), BagtubeServer.DEFAULT_WRITER)
-            bag.duration = metadata.duration.nanoseconds / 1e9
+            try:
+                info = Info()
+                metadata = info.read_metadata(os.path.join(self.bag_dir_path, dirname), BagtubeServer.DEFAULT_WRITER)
+                bag.duration = metadata.duration.nanoseconds / 1e9
 
-            response.bags.append(bag)
+                response.bags.append(bag)
+            except Exception as e:
+                self.get_logger().error(f"Error reading metadata for bag '{dirname}': {e}")
 
         # sort the bags by timestamp
         response.bags.sort(key=lambda bag: bag.stamp.sec + bag.stamp.nanosec/1e9)
