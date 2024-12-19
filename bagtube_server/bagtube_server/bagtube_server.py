@@ -5,7 +5,8 @@ import threading
 import shutil
 from rclpy.time import Duration, Time
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, QoSPresetProfiles, QoSReliabilityPolicy, \
+    QoSDurabilityPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -38,24 +39,30 @@ class BagtubeServer(Node):
         self.declare_parameter('max_total_size_gb', 0.0, ParameterDescriptor(description=
                                                          'Maximum total size of all bags in GB. 0 for unlimited. If exceeded, oldest bags will be deleted. Note:'
                                                          ' this is checked after a new bag is recorded, so the actual size may exceed this limit by a small amount.'))
+        self.declare_parameter('initial_wait_for_publishers_timeout', 10.0)
 
         self.bag_dir_path = self.get_parameter('bag_dir_path').get_parameter_value().string_value
         self.bag_dir_path = os.path.abspath(self.bag_dir_path)
         os.makedirs(self.bag_dir_path, exist_ok=True)
         self.max_total_size_gb = self.get_parameter('max_total_size_gb').get_parameter_value().double_value
+        self.initial_wait_for_publishers_timeout = self.get_parameter('initial_wait_for_publishers_timeout').get_parameter_value().double_value
 
         self.livestream_enabled = False
         self.recording_bag = False
         self.snapshot_reader = None
         self.snapshot_uri = None
 
+        # TODO: create Pipe class instead of using many dictionaries
         self.pipe_publishers = {}
         self.pipe_subscribers = {}
         self.topic_pipes = {}
         self.input_nodes_running_services = {}
         self.topic_remappings = {}
+        self.pipe_transient_local_last_messages = {}
+        self.pipe_qos_profiles = {}
         self.input_nodes_running_services_lock = threading.Lock()
 
+        self.init_time = self.get_clock().now()
         for pipe in pipes:
             type_str = self.declare_parameter(f'{pipe}.type', rclpy.Parameter.Type.STRING).get_parameter_value().string_value
             input_topic = self.declare_parameter(f'{pipe}.input_topic', rclpy.Parameter.Type.STRING).get_parameter_value().string_value
@@ -64,10 +71,11 @@ class BagtubeServer(Node):
             self.topic_remappings[input_topic] = output_topic
             self.topic_pipes[input_topic] = pipe
 
-            msg_type = self.load_message_type(type_str)
+            msg_type = self.load_message_type(type_str)  # TODO: get type automatically from publishers
             if msg_type:
-                self.pipe_publishers[pipe] = self.create_publisher(msg_type, output_topic, 10)
-                qos = self.get_qos_profile_for_msg_type(msg_type)
+                qos = self.get_qos_profile_for_topic(input_topic)
+                self.pipe_qos_profiles[pipe] = qos
+                self.pipe_publishers[pipe] = self.create_publisher(msg_type, output_topic, qos)
                 self.pipe_subscribers[pipe] = self.create_subscription(
                     msg_type,
                     input_topic,
@@ -126,6 +134,9 @@ class BagtubeServer(Node):
     def livestream_callback(self, request, response):
         with self.input_nodes_running_services_lock:
             self.livestream_enabled = request.data
+        if request.data:
+            for pipe, msg in self.pipe_transient_local_last_messages.items():
+                self.pipe_publishers[pipe].publish(msg)
         self.toggle_input_nodes_running()
 
         response.success = True
@@ -156,12 +167,62 @@ class BagtubeServer(Node):
         except (ValueError, ImportError, AttributeError):
             return None
 
-    def get_qos_profile_for_msg_type(self, msg_type):
-        # Define custom QoS profiles for specific message types if needed
-        # For now, using a sensor data profile
-        return qos_profile_sensor_data
+    def get_qos_profile_for_topic(self, topic_name):
+        qos_profile = QoSPresetProfiles.get_from_short_key('sensor_data')
+        reliability_reliable_endpoints_count = 0
+        durability_transient_local_endpoints_count = 0
+
+        pubs_info = self.get_publishers_info_by_topic(topic_name)
+        publishers_count = len(pubs_info)
+        while rclpy.ok() and publishers_count == 0 and self.get_clock().now() - self.init_time < Duration(seconds=self.initial_wait_for_publishers_timeout):
+            self.get_logger().warn(f"No publishers found for topic '{topic_name}'. Waiting for publishers...")
+            self.get_clock().sleep_for(Duration(seconds=1))
+            pubs_info = self.get_publishers_info_by_topic(topic_name)
+            publishers_count = len(pubs_info)
+            if publishers_count > 0:
+                self.get_logger().info(f"Publishers found for topic '{topic_name}', done waiting")
+
+        if publishers_count == 0:
+            self.get_logger().warn(f"No publishers found for topic '{topic_name}'. Using default QoS profile")
+            return qos_profile
+
+        for info in pubs_info:
+            if (info.qos_profile.reliability == QoSReliabilityPolicy.RELIABLE):
+                reliability_reliable_endpoints_count += 1
+            if (info.qos_profile.durability == QoSDurabilityPolicy.TRANSIENT_LOCAL):
+                durability_transient_local_endpoints_count += 1
+
+        # If all endpoints are reliable, ask for reliable
+        if reliability_reliable_endpoints_count == publishers_count:
+            qos_profile.reliability = QoSReliabilityPolicy.RELIABLE
+        else:
+            if reliability_reliable_endpoints_count > 0:
+                print(
+                    'Some, but not all, publishers are offering '
+                    'QoSReliabilityPolicy.RELIABLE. Falling back to '
+                    'QoSReliabilityPolicy.BEST_EFFORT as it will connect '
+                    'to all publishers'
+                )
+            qos_profile.reliability = QoSReliabilityPolicy.BEST_EFFORT
+
+        # If all endpoints are transient_local, ask for transient_local
+        if durability_transient_local_endpoints_count == publishers_count:
+            qos_profile.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        else:
+            if durability_transient_local_endpoints_count > 0:
+                print(
+                    'Some, but not all, publishers are offering '
+                    'QoSDurabilityPolicy.TRANSIENT_LOCAL. Falling back to '
+                    'QoSDurabilityPolicy.VOLATILE as it will connect '
+                    'to all publishers'
+                )
+            qos_profile.durability = QoSDurabilityPolicy.VOLATILE
+
+        return qos_profile
 
     def pipe_callback(self, msg, pipe):
+        if self.pipe_qos_profiles[pipe].durability == QoSDurabilityPolicy.TRANSIENT_LOCAL:
+            self.pipe_transient_local_last_messages[pipe] = msg
         if self.livestream_enabled:
             self.pipe_publishers[pipe].publish(msg)
 
@@ -204,7 +265,7 @@ class BagtubeServer(Node):
         date_string = datetime.datetime.utcfromtimestamp(sec + nsec/1e9).strftime(BagtubeServer.STAMP_FORMAT)
         bag_name = request.name + '-' + date_string
         # rename the bag directory
-        if request.command == EditBag.Request.RENAME:
+        if request.operation == EditBag.Request.RENAME:
             old_bag_name = bag_name
             old_bag_path = os.path.join(self.bag_dir_path, old_bag_name)
             new_bag_name = request.new_name + '-' + date_string
@@ -216,7 +277,7 @@ class BagtubeServer(Node):
             else:
                 response.success = False
                 response.message = f"Bag '{old_bag_name}' does not exist"
-        elif request.command == EditBag.Request.DELETE:
+        elif request.operation == EditBag.Request.DELETE:
             bag_name = bag_name
             bag_path = os.path.join(self.bag_dir_path, bag_name)
             if os.path.exists(bag_path):
@@ -538,9 +599,9 @@ def main(args=None):
         executor.spin()
     except KeyboardInterrupt:
         node.get_logger().info('Keyboard interrupt, shutting down.\n')
-    node.destroy_node()
-    rclpy.shutdown()
-    shutdown_rclcpp()
+    finally:
+        shutdown_rclcpp()
+        node.destroy_node()
 
 if __name__ == '__main__':
     main()

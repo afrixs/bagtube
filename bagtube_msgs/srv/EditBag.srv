@@ -1,10 +1,10 @@
 uint32 RENAME=0
 uint32 DELETE=1
 
-uint32 command
+uint32 operation
 string name
 builtin_interfaces/Time stamp
-string new_name  # for RENAME command
+string new_name  # for RENAME operation
 
 ---
 

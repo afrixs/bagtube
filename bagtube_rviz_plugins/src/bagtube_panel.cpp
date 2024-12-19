@@ -290,7 +290,7 @@ void BagtubePanel::onBagDelete(int row, int /*column*/)
     play_bag_ac_->async_cancel_goal(play_bag_goal_handle_);
 
   auto request = std::make_shared<bagtube_msgs::srv::EditBag::Request>();
-  request->command = bagtube_msgs::srv::EditBag::Request::DELETE;
+  request->operation = bagtube_msgs::srv::EditBag::Request::DELETE;
   request->name = bags_[row].name;
   request->stamp = bags_[row].stamp;
   if (auto response = callService<bagtube_msgs::srv::EditBag>(edit_bag_cl_, request); response && response->success) {
@@ -315,7 +315,7 @@ void BagtubePanel::onBagNameEdited(int row, int column)
     play_bag_ac_->async_cancel_goal(play_bag_goal_handle_);
 
   auto request = std::make_shared<bagtube_msgs::srv::EditBag::Request>();
-  request->command = bagtube_msgs::srv::EditBag::Request::RENAME;
+  request->operation = bagtube_msgs::srv::EditBag::Request::RENAME;
   request->name = bags_[row].name;
   request->stamp = bags_[row].stamp;
   request->new_name = new_name;
