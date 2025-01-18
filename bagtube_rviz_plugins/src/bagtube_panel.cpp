@@ -221,12 +221,12 @@ QString BagtubePanel::durationToString(double duration) {
 template<typename MsgT>
 typename MsgT::Response::SharedPtr BagtubePanel::callService(typename rclcpp::Client<MsgT>::SharedPtr client, const typename MsgT::Request::SharedPtr& request)
 {
-  bool connected = client->wait_for_service(800ms);
+  bool connected = client->wait_for_service(1000ms);
   if (!connected)
     return nullptr;
   auto result = client->async_send_request(request);
   typename MsgT::Response::SharedPtr response;
-  if (sync_response_executor_->spin_until_future_complete(result, 800ms) == rclcpp::FutureReturnCode::SUCCESS &&
+  if (sync_response_executor_->spin_until_future_complete(result, 2000ms) == rclcpp::FutureReturnCode::SUCCESS &&
       (response = result.get())) {
     return response;
   }
@@ -518,9 +518,11 @@ void BagtubePanel::onLivestreamButtonClicked(bool checked) {
   if (auto response = callService<std_srvs::srv::SetBool>(livestream_cl_, request); !response || !response->success) {
     livestream_button_->setChecked(!checked);
     onLivestreamEnabledChanged();
-    RCLCPP_ERROR(LOGGER, "Failed to %s livestream",
-                 checked ? "enable" : "disable");
+    RCLCPP_ERROR(LOGGER, "Failed to %s livestream: %s",
+                 checked ? "enable" : "disable", response ? response->message.c_str() : "no response");
   }
+  else
+    RCLCPP_INFO(LOGGER, "Livestream %s", checked ? "enabled" : "disabled");
 }
 
 void BagtubePanel::onRecordNameChanged(const QString &text) {
